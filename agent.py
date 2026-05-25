@@ -5,6 +5,7 @@ import sys
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+import state
 from prompts import SYSTEM_PROMPT
 from tools import (
     check_normality,
@@ -143,7 +144,7 @@ TOOLS = [
                 "group_col": {"type": "string"},
                 "save_path": {"type": "string"},
             },
-            "required": ["value_col", "group_col", "save_path"],
+            "required": ["value_col", "group_col"],
         },
     },
     {
@@ -157,7 +158,7 @@ TOOLS = [
                 "group_value": {"type": "string"},
                 "save_path": {"type": "string"},
             },
-            "required": ["column", "save_path"],
+            "required": ["column"],
         },
     },
 ]
@@ -194,6 +195,7 @@ class StatAgent:
 
     def run(self, user_question: str):
         messages = [{"role": "user", "content": user_question}]
+        self.messages = messages
 
         for _ in range(15):
             response = self.client.messages.create(
@@ -228,6 +230,13 @@ class StatAgent:
                 return
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
+                if state.current_plan:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": f"[StatPlan 当前状态]\n\n{state.current_plan.summary()}",
+                        }
+                    )
             else:
                 print("\nAgent stopped without tool results.")
                 return

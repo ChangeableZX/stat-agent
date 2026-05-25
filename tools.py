@@ -1,5 +1,6 @@
 import math
 import os
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -265,7 +266,7 @@ def run_wilcoxon(col1: str, col2: str):
         return {"error": str(exc)}
 
 
-def plot_boxplot(value_col: str, group_col: str, save_path: str):
+def plot_boxplot(value_col: str, group_col: str, save_path: str = None):
     """Save a boxplot under output/ and record the path in the current plan."""
     try:
         import matplotlib.pyplot as plt
@@ -273,7 +274,8 @@ def plot_boxplot(value_col: str, group_col: str, save_path: str):
         df = _require_data()
         groups = [g for g in df[group_col].dropna().unique().tolist()]
         data = [pd.to_numeric(df[df[group_col] == g][value_col], errors="coerce").dropna() for g in groups]
-        path = _output_path(save_path)
+        os.makedirs("output", exist_ok=True)
+        path = _output_path(save_path) if save_path else _default_boxplot_path()
         plt.figure(figsize=(6, 4))
         plt.boxplot(data, labels=[str(g) for g in groups])
         plt.ylabel(value_col)
@@ -282,7 +284,7 @@ def plot_boxplot(value_col: str, group_col: str, save_path: str):
         plt.savefig(path, dpi=150)
         plt.close()
         _store_plot(path)
-        return {"plot_path": path}
+        return {"plot_path": path, "saved_to": path}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -301,7 +303,8 @@ def plot_qq(column: str, group_col: str = None, group_value: str = None, save_pa
                 df = df[df[group_col] == group_value]
             values = pd.to_numeric(df[column], errors="coerce").dropna()
             title = f"{column}" if group_value is None else f"{column} ({group_value})"
-        path = _output_path(save_path)
+        os.makedirs("output", exist_ok=True)
+        path = _output_path(save_path) if save_path and save_path != "qq.png" else _default_qq_path(group_value)
         plt.figure(figsize=(5, 5))
         stats.probplot(values, dist="norm", plot=plt)
         plt.title(f"Q-Q plot: {title}")
@@ -309,7 +312,7 @@ def plot_qq(column: str, group_col: str = None, group_value: str = None, save_pa
         plt.savefig(path, dpi=150)
         plt.close()
         _store_plot(path)
-        return {"plot_path": path}
+        return {"plot_path": path, "saved_to": path}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -478,3 +481,14 @@ def _output_path(save_path):
         path = f"output/{os.path.basename(path)}"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return path
+
+
+def _default_boxplot_path():
+    plan = state.get_current_plan()
+    method = plan.selected_method if plan and plan.selected_method else "preview"
+    return f"output/boxplot_{method}_{datetime.now().strftime('%H%M%S')}.png"
+
+
+def _default_qq_path(group_value):
+    label = str(group_value) if group_value else "all"
+    return f"output/qq_{label}_{datetime.now().strftime('%H%M%S')}.png"

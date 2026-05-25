@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 
 @dataclass
@@ -21,22 +21,37 @@ class StatPlan:
 
     def summary(self) -> str:
         lines = [
-            f"研究问题: {self.research_question}",
-            f"意图: {self.intent}",
-            f"设计: {self.design}",
-            f"目标变量: {self.target_variable}",
-            f"分组变量: {self.grouping_variable}",
-            f"配对列: {self.paired_columns}",
-            f"数据质量: {self.data_quality}",
-            f"样本量: {self.sample_sizes}",
-            f"前提检验: {self.assumption_checks}",
-            f"选择方法: {self.selected_method}",
-            f"决策路径: {self.method_rationale}",
-            f"结果: {self.results}",
-            f"图: {self.plots}",
+            "## 当前分析状态(StatPlan 快照)",
+            "",
+            f"**研究问题**: {self.research_question}",
+            f"**意图**: {self.intent}",
+            f"**目标变量**: {self.target_variable}",
         ]
+        if self.design == "paired":
+            lines.append(f"**配对列**: {self.paired_columns}")
+        elif self.grouping_variable:
+            lines.append(f"**分组变量**: {self.grouping_variable}")
+        lines.append(f"**实验设计**: {self.design}")
+        if self.data_quality:
+            lines.extend(["", f"**数据质量**: {self.data_quality}"])
+        if self.sample_sizes:
+            lines.extend(["", f"**样本量**: {self.sample_sizes}"])
+        if self.assumption_checks:
+            lines.extend(["", "**前提检验**:"])
+            for name, value in self.assumption_checks.items():
+                lines.append(f"- {name}: {value}")
+        if self.selected_method:
+            lines.extend(["", f"**选定方法**: {self.selected_method}"])
+        if self.method_rationale:
+            lines.extend(["", "**决策路径**:"])
+            for item in self.method_rationale:
+                lines.append(f"- {item}")
+        if self.results:
+            lines.extend(["", f"**统计结果**: {self.results}"])
+        if self.plots:
+            lines.extend(["", f"**已生成图表**: {self.plots}"])
         if self.interpretation:
-            lines.append(f"解释: {self.interpretation}")
+            lines.extend(["", f"**解释**: {self.interpretation}"])
         return "\n".join(lines)
 
     def to_dict(self) -> dict:

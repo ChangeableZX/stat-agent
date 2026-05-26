@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from typing import Any, Callable
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -284,3 +285,75 @@ class StatAgent:
     @staticmethod
     def _pretty(obj):
         return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def run_agent_with_callbacks(
+    user_msg: str,
+    on_text: Callable[[str], None] = None,
+    on_tool_call: Callable[[str, dict], None] = None,
+    on_tool_result: Callable[[str, dict], None] = None,
+    on_plan_update: Callable[[Any], None] = None,
+    on_complete: Callable[[str], None] = None,
+) -> str:
+    """Run StatAgent with optional callbacks for UI display."""
+    agent = StatAgent()
+    messages = [{"role": "user", "content": user_msg}]
+    agent.messages = messages
+    final_text = []
+
+    for _ in range(15):
+        response = agent.client.messages.create(
+            model=agent.model,
+            max_tokens=agent.max_tokens,
+            system=SYSTEM_PROMPT,
+            messages=messages,
+            tools=TOOLS,
+        )
+        assistant_content = [block.model_dump(exclude_none=True) for block in response.content]
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "text" and block.text.strip():
+                final_text.append(block.text.strip())
+                if on_text:
+                    on_text(block.text.strip())
+            elif block.type == "tool_use":
+                if on_tool_call:
+                    on_tool_call(block.name, block.input)
+                result = agent.tool_map[block.name](**block.input)
+                if on_tool_result:
+                    on_tool_result(block.name, result)
+                if state.current_plan and on_plan_update:
+                    on_plan_update(state.current_plan)
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+
+        if response.stop_reason == "end_turn":
+            output = "\n\n".join(final_text)
+            if on_complete:
+                on_complete(output)
+            return output
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+            if state.current_plan:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[StatPlan 褰撳墠鐘舵€乚\n\n{state.current_plan.summary()}",
+                    }
+                )
+                if on_plan_update:
+                    on_plan_update(state.current_plan)
+        else:
+            break
+
+    output = "\n\n".join(final_text)
+    if on_complete:
+        on_complete(output)
+    return output

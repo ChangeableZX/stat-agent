@@ -7,34 +7,74 @@ import pandas as pd
 from scipy import stats
 
 import state
-from decision import select_method_for_two_group
-from state import StatPlan
+from decision import select_method as route_select_method
+from state import CategoricalPlan, CorrelationPlan, MultiGroupPlan, TwoGroupPlan
 
 
 _DATA_CACHE = None
 _MISSING_MARKERS = {"", "na", "n/a", "nan", "null", "none"}
 
 
-def make_analysis_plan(
-    research_question: str,
-    intent: str,
-    target_variable: str,
-    grouping_variable: str = None,
-    paired_columns=None,
-    design: str = "independent",
-):
-    """Initialize the global StatPlan from the LLM's interpretation of the user question."""
+def make_analysis_plan(research_question: str, intent: str, **kwargs):
+    """Create the correct StatPlan subclass after validating intent-specific fields."""
     try:
-        if paired_columns:
-            paired_columns = tuple(paired_columns)
-        plan = StatPlan(
-            research_question=research_question,
-            intent=intent,
-            target_variable=target_variable,
-            grouping_variable=grouping_variable,
-            paired_columns=paired_columns,
-            design=design,
-        )
+        valid_intents = ["compare_two_groups", "compare_multi_groups", "correlation", "categorical_test"]
+        if intent not in valid_intents:
+            return {"error": f"intent 必须是 {valid_intents} 之一,得到 '{intent}'"}
+        missing = []
+        if intent == "compare_two_groups":
+            missing += _missing(kwargs, ["target_variable"])
+            design = kwargs.get("design", "independent")
+            if design == "paired":
+                missing += _missing(kwargs, ["paired_columns"])
+            else:
+                missing += _missing(kwargs, ["grouping_variable"])
+        elif intent == "compare_multi_groups":
+            missing += _missing(kwargs, ["target_variable", "grouping_variable"])
+        elif intent == "correlation":
+            missing += _missing(kwargs, ["x_variable", "y_variable"])
+        elif intent == "categorical_test":
+            missing += _missing(kwargs, ["row_variable", "col_variable"])
+        if missing:
+            return {"error": f"make_analysis_plan 缺少字段: {missing}. 请补全后重试。"}
+
+        if intent == "compare_two_groups":
+            paired_columns = kwargs.get("paired_columns")
+            if paired_columns:
+                paired_columns = tuple(paired_columns)
+            plan = TwoGroupPlan(
+                research_question=research_question,
+                intent=intent,
+                target_variable=kwargs["target_variable"],
+                grouping_variable=kwargs.get("grouping_variable"),
+                paired_columns=paired_columns,
+                design=kwargs.get("design", "independent"),
+            )
+        elif intent == "compare_multi_groups":
+            plan = MultiGroupPlan(
+                research_question=research_question,
+                intent=intent,
+                target_variable=kwargs["target_variable"],
+                grouping_variable=kwargs["grouping_variable"],
+                design=kwargs.get("design", "independent"),
+            )
+        elif intent == "correlation":
+            plan = CorrelationPlan(
+                research_question=research_question,
+                intent=intent,
+                x_variable=kwargs["x_variable"],
+                y_variable=kwargs["y_variable"],
+                x_type=kwargs.get("x_type", "continuous"),
+                y_type=kwargs.get("y_type", "continuous"),
+            )
+        else:
+            plan = CategoricalPlan(
+                research_question=research_question,
+                intent=intent,
+                row_variable=kwargs["row_variable"],
+                col_variable=kwargs["col_variable"],
+                paired=bool(kwargs.get("paired", False)),
+            )
         state.set_current_plan(plan)
         return plan.to_dict()
     except Exception as exc:
@@ -62,14 +102,9 @@ def load_data(file_path: str):
             missing_like = int(lowered.isin(_MISSING_MARKERS).sum())
             parsed = pd.to_numeric(raw, errors="coerce")
             has_numeric_values = int(parsed.notna().sum()) > 0
-            non_numeric = 0
-            if has_numeric_values:
-                non_numeric = int((~lowered.isin(_MISSING_MARKERS) & parsed.isna()).sum())
+            non_numeric = int((~lowered.isin(_MISSING_MARKERS) & parsed.isna()).sum()) if has_numeric_values else 0
             if missing_like or non_numeric:
-                data_quality[col] = {
-                    "missing_like_values": missing_like,
-                    "non_numeric_values": non_numeric,
-                }
+                data_quality[col] = {"missing_like_values": missing_like, "non_numeric_values": non_numeric}
         result = {
             "rows": int(len(df)),
             "columns": list(df.columns),
@@ -81,8 +116,14 @@ def load_data(file_path: str):
         plan = state.get_current_plan()
         if plan:
             plan.data_quality = data_quality
-            if plan.grouping_variable in value_counts:
+            if isinstance(plan, (TwoGroupPlan, MultiGroupPlan)) and plan.grouping_variable in value_counts:
                 plan.sample_sizes = value_counts[plan.grouping_variable]
+                if isinstance(plan, MultiGroupPlan):
+                    plan.group_levels = list(value_counts[plan.grouping_variable].keys())
+            if isinstance(plan, CategoricalPlan) and plan.row_variable in df.columns and plan.col_variable in df.columns:
+                table = pd.crosstab(df[plan.row_variable], df[plan.col_variable])
+                plan.table_shape = tuple(table.shape)
+                plan.sample_sizes = {"rows": int(table.shape[0]), "cols": int(table.shape[1]), "n": int(table.values.sum())}
         return result
     except Exception as exc:
         return {"error": str(exc)}
@@ -91,9 +132,7 @@ def load_data(file_path: str):
 def check_normality(column: str, group_column: str = None, group_value: str = None):
     """Run a Shapiro-Wilk normality test on a numeric column, optionally filtered to one group."""
     try:
-        if _DATA_CACHE is None:
-            return {"error": "No data loaded. Call load_data first."}
-        df = _DATA_CACHE
+        df = _require_data()
         if column not in df.columns:
             values = _paired_diff_values(column)
             if values is None:
@@ -108,7 +147,6 @@ def check_normality(column: str, group_column: str = None, group_value: str = No
             group_rows = int(len(df))
             values = pd.to_numeric(df[column], errors="coerce").dropna()
             check_key = f"normality_{group_value}" if group_value is not None else f"normality_{column}"
-
         n = int(len(values))
         if n < 3:
             return {
@@ -117,7 +155,6 @@ def check_normality(column: str, group_column: str = None, group_value: str = No
                 "valid_n": n,
                 "dropped_missing_or_invalid": group_rows - n,
             }
-
         stat, p_value = stats.shapiro(values)
         result = {
             "column": column,
@@ -139,20 +176,117 @@ def check_normality(column: str, group_column: str = None, group_value: str = No
 
 
 def check_variance_equality(value_col: str, group_col: str):
-    """Run Levene's test for equal variance across exactly two groups."""
+    """Run Levene's test for equal variance across two or more groups."""
     try:
-        groups, x1, x2 = _two_group_values(value_col, group_col)
-        stat, p_value = stats.levene(x1, x2)
+        groups, arrays = _group_arrays(value_col, group_col)
+        stat, p_value = stats.levene(*arrays)
         result = {
             "statistic": float(stat),
             "p_value": float(p_value),
             "equal_variance": bool(p_value >= 0.05),
-            "variances": {str(groups[0]): float(x1.var(ddof=1)), str(groups[1]): float(x2.var(ddof=1))},
+            "variances": {str(g): float(a.var(ddof=1)) for g, a in zip(groups, arrays)},
         }
         plan = state.get_current_plan()
         if plan:
             plan.assumption_checks["variance_equality"] = result
         return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_sphericity(subject_col: str, within_col: str, value_col: str):
+    """Run Mauchly's sphericity test for repeated-measures data."""
+    try:
+        plan = _guard(MultiGroupPlan, "check_sphericity")
+        if isinstance(plan, dict):
+            return plan
+        import pingouin as pg
+
+        df = _require_data().dropna(subset=[subject_col, within_col, value_col])
+        wide = df.pivot(index=subject_col, columns=within_col, values=value_col)
+        sph, w_value, chi2, dof, p_value = pg.sphericity(wide)
+        result = {"passed": bool(sph), "w": float(w_value), "chi2": float(chi2), "dof": int(dof), "p_value": float(p_value)}
+        plan.assumption_checks["sphericity"] = result
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_bivariate_normality(x_col: str, y_col: str):
+    """Simplified bivariate normality check: Shapiro-Wilk on both variables."""
+    try:
+        plan = _guard(CorrelationPlan, "check_bivariate_normality")
+        if isinstance(plan, dict):
+            return plan
+        df = _numeric_pair(x_col, y_col)
+        sx, px = stats.shapiro(df[x_col])
+        sy, py = stats.shapiro(df[y_col])
+        result = {
+            "passed": bool(px >= 0.05 and py >= 0.05),
+            "x": {"statistic": float(sx), "p_value": float(px)},
+            "y": {"statistic": float(sy), "p_value": float(py)},
+            "n": int(len(df)),
+        }
+        plan.assumption_checks["bivariate_normality"] = result
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_linearity(x_col: str, y_col: str):
+    """Simplified linearity check using Pearson vs Spearman similarity."""
+    try:
+        plan = _guard(CorrelationPlan, "check_linearity")
+        if isinstance(plan, dict):
+            return plan
+        df = _numeric_pair(x_col, y_col)
+        pearson_r, _ = stats.pearsonr(df[x_col], df[y_col])
+        spearman_r, _ = stats.spearmanr(df[x_col], df[y_col])
+        result = {
+            "passed": bool(abs(pearson_r - spearman_r) < 0.15),
+            "pearson_r": float(pearson_r),
+            "spearman_r": float(spearman_r),
+        }
+        plan.assumption_checks["linearity"] = result
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_expected_frequencies(row_col: str, col_col: str):
+    """Compute chi-square expected frequencies for a contingency table."""
+    try:
+        plan = _guard(CategoricalPlan, "check_expected_frequencies")
+        if isinstance(plan, dict):
+            return plan
+        table = pd.crosstab(_require_data()[row_col], _require_data()[col_col])
+        chi2, p_value, dof, expected = stats.chi2_contingency(table, correction=False)
+        low = expected < 5
+        result = {
+            "table_shape": tuple(table.shape),
+            "expected": expected.tolist(),
+            "all_expected_ge_5": bool(np.all(~low)),
+            "low_frequency_ratio": float(low.sum() / expected.size),
+            "chi2_preview": float(chi2),
+            "p_value_preview": float(p_value),
+            "dof": int(dof),
+        }
+        plan.table_shape = tuple(table.shape)
+        plan.assumption_checks["expected_frequencies"] = result
+        return _jsonable(result)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def build_contingency_table(row_col: str, col_col: str):
+    """Build and return a contingency table."""
+    try:
+        plan = _guard(CategoricalPlan, "build_contingency_table")
+        if isinstance(plan, dict):
+            return plan
+        table = pd.crosstab(_require_data()[row_col], _require_data()[col_col])
+        plan.table_shape = tuple(table.shape)
+        return {"table": table.to_dict(), "table_shape": list(table.shape)}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -163,13 +297,9 @@ def select_method():
         plan = state.get_current_plan()
         if plan is None:
             return {"error": "No StatPlan exists. Call make_analysis_plan first."}
-        plan = select_method_for_two_group(plan)
+        plan = route_select_method(plan)
         state.set_current_plan(plan)
-        return {
-            "selected_method": plan.selected_method,
-            "method_rationale": plan.method_rationale,
-            "plan_summary": plan.summary(),
-        }
+        return {"selected_method": plan.selected_method, "method_rationale": plan.method_rationale, "plan_summary": plan.summary()}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -177,6 +307,9 @@ def select_method():
 def run_independent_ttest(value_column: str, group_column: str, equal_var: bool = True):
     """Run an independent-samples t-test for exactly two groups and return effect size and CI."""
     try:
+        plan = state.get_current_plan()
+        if plan is not None and not isinstance(plan, TwoGroupPlan):
+            return {"error": f"run_independent_ttest 要求 TwoGroupPlan,当前是 {type(plan).__name__}"}
         groups, x1, x2, raw1, raw2 = _two_group_values(value_column, group_column, include_raw=True)
         result = _independent_ttest_result(groups, x1, x2, raw1, raw2, equal_var)
         _store_result(result)
@@ -193,6 +326,9 @@ def run_welch_ttest(value_col: str, group_col: str):
 def run_mannwhitney(value_col: str, group_col: str):
     """Run Mann-Whitney U test for two independent groups."""
     try:
+        plan = _guard(TwoGroupPlan, "run_mannwhitney")
+        if isinstance(plan, dict):
+            return plan
         groups, x1, x2, raw1, raw2 = _two_group_values(value_col, group_col, include_raw=True)
         u_stat, p_value = stats.mannwhitneyu(x1, x2, alternative="two-sided")
         n1, n2 = len(x1), len(x2)
@@ -215,26 +351,24 @@ def run_mannwhitney(value_col: str, group_col: str):
 def run_paired_ttest(col1: str, col2: str):
     """Run a paired-samples t-test for two numeric columns."""
     try:
+        plan = _guard(TwoGroupPlan, "run_paired_ttest")
+        if isinstance(plan, dict):
+            return plan
         x, y = _paired_values(col1, col2)
         diff = x - y
         stat, p_value = stats.ttest_rel(x, y)
         n = len(diff)
         mean_diff = float(diff.mean())
         se = float(diff.std(ddof=1) / math.sqrt(n))
-        dfree = n - 1
-        t_crit = stats.t.ppf(0.975, dfree)
-        ci = [mean_diff - t_crit * se, mean_diff + t_crit * se]
+        t_crit = stats.t.ppf(0.975, n - 1)
         dz = mean_diff / float(diff.std(ddof=1)) if float(diff.std(ddof=1)) else float("nan")
         result = {
             "method": "paired_t",
             "statistic": float(stat),
             "p_value": float(p_value),
             "effect_size": {"name": "cohens_dz", "value": float(dz), "magnitude": _cohens_magnitude(dz)},
-            "ci_95": [float(ci[0]), float(ci[1])],
-            "group_stats": {
-                col1: _one_group_stats(x),
-                col2: _one_group_stats(y),
-            },
+            "ci_95": [float(mean_diff - t_crit * se), float(mean_diff + t_crit * se)],
+            "group_stats": {col1: _one_group_stats(x), col2: _one_group_stats(y)},
             "interpretation_hints": _hints(float(p_value), float(y.mean() - x.mean()), n, n),
         }
         _store_result(result)
@@ -246,11 +380,13 @@ def run_paired_ttest(col1: str, col2: str):
 def run_wilcoxon(col1: str, col2: str):
     """Run Wilcoxon signed-rank test for paired columns."""
     try:
+        plan = _guard(TwoGroupPlan, "run_wilcoxon")
+        if isinstance(plan, dict):
+            return plan
         x, y = _paired_values(col1, col2)
         stat, p_value = stats.wilcoxon(x, y)
-        n = len(x)
         z_approx = stats.norm.isf(float(p_value) / 2)
-        r_value = abs(z_approx) / math.sqrt(n)
+        r_value = abs(z_approx) / math.sqrt(len(x))
         result = {
             "method": "wilcoxon",
             "statistic": float(stat),
@@ -258,10 +394,274 @@ def run_wilcoxon(col1: str, col2: str):
             "effect_size": {"name": "r", "value": float(r_value), "magnitude": _r_magnitude(r_value)},
             "ci_95": [None, None],
             "group_stats": {col1: _one_group_stats(x), col2: _one_group_stats(y)},
-            "interpretation_hints": _hints(float(p_value), float(y.median() - x.median()), n, n),
+            "interpretation_hints": _hints(float(p_value), float(y.median() - x.median()), len(x), len(y)),
         }
         _store_result(result)
         return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_one_way_anova(value_col: str, group_col: str):
+    """Run one-way ANOVA for independent multi-group data."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_one_way_anova")
+        if isinstance(plan, dict):
+            return plan
+        groups, arrays = _group_arrays(value_col, group_col)
+        stat, p_value = stats.f_oneway(*arrays)
+        eta = _eta_squared_anova(arrays)
+        result = _multi_result("one_way_anova", stat, p_value, groups, arrays, "eta_squared", eta)
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_welch_anova(value_col: str, group_col: str):
+    """Run Welch ANOVA for independent multi-group data."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_welch_anova")
+        if isinstance(plan, dict):
+            return plan
+        import pingouin as pg
+
+        df = _require_data().dropna(subset=[value_col, group_col]).copy()
+        df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+        df = df.dropna(subset=[value_col])
+        out = pg.welch_anova(data=df, dv=value_col, between=group_col).iloc[0]
+        groups, arrays = _group_arrays(value_col, group_col)
+        p_col = "p-unc" if "p-unc" in out else "p_unc"
+        result = _multi_result("welch_anova", out["F"], out[p_col], groups, arrays, "np2", out.get("np2", np.nan))
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_kruskal_wallis(value_col: str, group_col: str):
+    """Run Kruskal-Wallis H test."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_kruskal_wallis")
+        if isinstance(plan, dict):
+            return plan
+        groups, arrays = _group_arrays(value_col, group_col)
+        stat, p_value = stats.kruskal(*arrays)
+        epsilon_sq = max((stat - len(groups) + 1) / (sum(len(a) for a in arrays) - len(groups)), 0)
+        result = _multi_result("kruskal_wallis", stat, p_value, groups, arrays, "epsilon_squared", epsilon_sq)
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_repeated_anova(subject_col: str, within_col: str, value_col: str):
+    """Run repeated-measures ANOVA using pingouin."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_repeated_anova")
+        if isinstance(plan, dict):
+            return plan
+        import pingouin as pg
+
+        df = _require_data().dropna(subset=[subject_col, within_col, value_col]).copy()
+        out = pg.rm_anova(data=df, dv=value_col, within=within_col, subject=subject_col, detailed=True).iloc[0]
+        result = {
+            "method": "repeated_anova",
+            "statistic": float(out["F"]),
+            "p_value": float(out["p-unc"]),
+            "effect_size": {"name": "ng2", "value": float(out.get("ng2", np.nan)), "magnitude": _eta_magnitude(out.get("ng2", 0))},
+            "group_stats": _group_stats(df, value_col, within_col),
+            "interpretation_hints": _generic_hints(float(out["p-unc"]), "某些条件之间有差异,需事后检验"),
+        }
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_friedman(subject_col: str, within_col: str, value_col: str):
+    """Run Friedman test for repeated-measures data."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_friedman")
+        if isinstance(plan, dict):
+            return plan
+        df = _require_data().dropna(subset=[subject_col, within_col, value_col])
+        wide = df.pivot(index=subject_col, columns=within_col, values=value_col).dropna()
+        stat, p_value = stats.friedmanchisquare(*[wide[col] for col in wide.columns])
+        result = {
+            "method": "friedman",
+            "statistic": float(stat),
+            "p_value": float(p_value),
+            "effect_size": {"name": "kendall_w", "value": float(stat / (len(wide) * (wide.shape[1] - 1))), "magnitude": "medium"},
+            "group_stats": _group_stats(df, value_col, within_col),
+            "interpretation_hints": _generic_hints(float(p_value), "某些条件之间有差异,需事后检验"),
+        }
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_posthoc_tukey(value_col: str, group_col: str):
+    """Run Tukey HSD posthoc test."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_posthoc_tukey")
+        if isinstance(plan, dict):
+            return plan
+        import pingouin as pg
+
+        out = pg.pairwise_tukey(data=_require_data(), dv=value_col, between=group_col)
+        return {"method": "tukey_hsd", "comparisons": _jsonable(out.to_dict(orient="records"))}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_posthoc_games_howell(value_col: str, group_col: str):
+    """Run Games-Howell posthoc test."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_posthoc_games_howell")
+        if isinstance(plan, dict):
+            return plan
+        import pingouin as pg
+
+        out = pg.pairwise_gameshowell(data=_require_data(), dv=value_col, between=group_col)
+        return {"method": "games_howell", "comparisons": _jsonable(out.to_dict(orient="records"))}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_posthoc_dunn(value_col: str, group_col: str, p_adjust: str = "bh"):
+    """Run Dunn posthoc test."""
+    try:
+        plan = _guard(MultiGroupPlan, "run_posthoc_dunn")
+        if isinstance(plan, dict):
+            return plan
+        import scikit_posthocs as sp
+
+        adjust = "fdr_bh" if p_adjust == "bh" else p_adjust
+        out = sp.posthoc_dunn(_require_data(), val_col=value_col, group_col=group_col, p_adjust=adjust)
+        return {"method": "dunn_bh", "p_values": _jsonable(out.to_dict())}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_pearson(x_col: str, y_col: str):
+    """Run Pearson correlation."""
+    return _correlation_result("pearson", x_col, y_col, stats.pearsonr)
+
+
+def run_spearman(x_col: str, y_col: str):
+    """Run Spearman correlation."""
+    return _correlation_result("spearman", x_col, y_col, stats.spearmanr)
+
+
+def run_kendall(x_col: str, y_col: str):
+    """Run Kendall tau correlation."""
+    return _correlation_result("kendall", x_col, y_col, stats.kendalltau)
+
+
+def run_chi_square(row_col: str, col_col: str, yates: bool = False):
+    """Run chi-square test of independence."""
+    try:
+        plan = _guard(CategoricalPlan, "run_chi_square")
+        if isinstance(plan, dict):
+            return plan
+        table = pd.crosstab(_require_data()[row_col], _require_data()[col_col])
+        chi2, p_value, dof, expected = stats.chi2_contingency(table, correction=yates)
+        method = "chi_square_yates" if yates else "chi_square"
+        result = {
+            "method": method,
+            "statistic": float(chi2),
+            "p_value": float(p_value),
+            "effect_size": {"name": "cramers_v", "value": _cramers_v(chi2, table), "magnitude": "medium"},
+            "group_stats": {"observed": table.to_dict(), "expected": expected.tolist()},
+            "interpretation_hints": _generic_hints(float(p_value), "分类变量之间有关联"),
+        }
+        _store_result(result)
+        return _jsonable(result)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_fisher_exact(row_col: str, col_col: str):
+    """Run Fisher exact test for a 2x2 table."""
+    try:
+        plan = _guard(CategoricalPlan, "run_fisher_exact")
+        if isinstance(plan, dict):
+            return plan
+        table = pd.crosstab(_require_data()[row_col], _require_data()[col_col])
+        if table.shape != (2, 2):
+            return {"error": f"run_fisher_exact 要求 2x2 表,当前是 {table.shape}"}
+        odds, p_value = stats.fisher_exact(table.values)
+        result = {
+            "method": "fisher_exact",
+            "statistic": float(odds),
+            "p_value": float(p_value),
+            "effect_size": {"name": "odds_ratio", "value": float(odds), "magnitude": "not_classified"},
+            "group_stats": {"observed": table.to_dict()},
+            "interpretation_hints": _generic_hints(float(p_value), "分类变量之间有关联"),
+        }
+        _store_result(result)
+        return _jsonable(result)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_fisher_freeman_halton(row_col: str, col_col: str):
+    """Approximate Fisher-Freeman-Halton fallback using chi-square for R x C tables."""
+    try:
+        plan = _guard(CategoricalPlan, "run_fisher_freeman_halton")
+        if isinstance(plan, dict):
+            return plan
+        result = run_chi_square(row_col, col_col, yates=False)
+        if "error" not in result:
+            result["method"] = "fisher_freeman_halton"
+            result["interpretation_hints"]["practical_caveat"] = "Python 环境中使用 chi-square 近似替代 Fisher-Freeman-Halton 精确检验"
+            _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_mcnemar(row_col: str, col_col: str):
+    """Run McNemar test for paired 2x2 categorical data."""
+    try:
+        plan = _guard(CategoricalPlan, "run_mcnemar")
+        if isinstance(plan, dict):
+            return plan
+        from statsmodels.stats.contingency_tables import mcnemar
+
+        table = pd.crosstab(_require_data()[row_col], _require_data()[col_col])
+        if table.shape != (2, 2):
+            return {"error": f"run_mcnemar 要求 2x2 表,当前是 {table.shape}"}
+        out = mcnemar(table.values, exact=False, correction=True)
+        result = _categorical_simple("mcnemar", out.statistic, out.pvalue, table)
+        _store_result(result)
+        return _jsonable(result)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_mcnemar_bowker(row_col: str, col_col: str):
+    """Run Bowker symmetry test for paired multi-category data."""
+    try:
+        plan = _guard(CategoricalPlan, "run_mcnemar_bowker")
+        if isinstance(plan, dict):
+            return plan
+        table = pd.crosstab(_require_data()[row_col], _require_data()[col_col])
+        values = table.values
+        stat = 0.0
+        dof = 0
+        for i in range(values.shape[0]):
+            for j in range(i + 1, values.shape[1]):
+                denom = values[i, j] + values[j, i]
+                if denom:
+                    stat += (values[i, j] - values[j, i]) ** 2 / denom
+                    dof += 1
+        p_value = stats.chi2.sf(stat, dof) if dof else 1.0
+        result = _categorical_simple("mcnemar_bowker", stat, p_value, table)
+        _store_result(result)
+        return _jsonable(result)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -317,10 +717,88 @@ def plot_qq(column: str, group_col: str = None, group_value: str = None, save_pa
         return {"error": str(exc)}
 
 
+def plot_grouped_boxplot(value_col: str, group_col: str):
+    """Save a grouped boxplot for multi-group analysis."""
+    return plot_boxplot(value_col, group_col)
+
+
+def plot_scatter(x_col: str, y_col: str, fit_line: bool = True):
+    """Save a scatter plot for correlation analysis."""
+    try:
+        plan = _guard(CorrelationPlan, "plot_scatter")
+        if isinstance(plan, dict):
+            return plan
+        import matplotlib.pyplot as plt
+
+        df = _numeric_pair(x_col, y_col)
+        path = f"output/scatter_{_method_label()}_{datetime.now().strftime('%H%M%S')}.png"
+        os.makedirs("output", exist_ok=True)
+        plt.figure(figsize=(6, 4))
+        plt.scatter(df[x_col], df[y_col], alpha=0.75)
+        if fit_line:
+            coeff = np.polyfit(df[x_col], df[y_col], 1)
+            xs = np.linspace(df[x_col].min(), df[x_col].max(), 100)
+            plt.plot(xs, coeff[0] * xs + coeff[1])
+        plt.xlabel(x_col)
+        plt.ylabel(y_col)
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+        _store_plot(path)
+        return {"plot_path": path, "saved_to": path}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def plot_mosaic(row_col: str, col_col: str):
+    """Save a simple stacked bar chart for a contingency table."""
+    try:
+        plan = _guard(CategoricalPlan, "plot_mosaic")
+        if isinstance(plan, dict):
+            return plan
+        import matplotlib.pyplot as plt
+
+        table = pd.crosstab(_require_data()[row_col], _require_data()[col_col])
+        path = f"output/mosaic_{_method_label()}_{datetime.now().strftime('%H%M%S')}.png"
+        os.makedirs("output", exist_ok=True)
+        table.plot(kind="bar", stacked=True, figsize=(6, 4))
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+        _store_plot(path)
+        return {"plot_path": path, "saved_to": path}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _missing(kwargs, names):
+    return [name for name in names if kwargs.get(name) in (None, "", [])]
+
+
+def _guard(expected_type, tool_name):
+    plan = state.get_current_plan()
+    if not isinstance(plan, expected_type):
+        return {"error": f"{tool_name} 要求 {expected_type.__name__},当前是 {type(plan).__name__}"}
+    return plan
+
+
 def _require_data():
     if _DATA_CACHE is None:
         raise ValueError("No data loaded. Call load_data first.")
     return _DATA_CACHE
+
+
+def _group_arrays(value_col, group_col):
+    df = _require_data()
+    if value_col not in df.columns:
+        raise ValueError(f"Value column not found: {value_col}")
+    if group_col not in df.columns:
+        raise ValueError(f"Group column not found: {group_col}")
+    groups = [g for g in df[group_col].dropna().unique().tolist()]
+    arrays = [pd.to_numeric(df[df[group_col] == g][value_col], errors="coerce").dropna() for g in groups]
+    if any(len(a) < 2 for a in arrays):
+        raise ValueError("Each group needs at least 2 valid numeric observations.")
+    return groups, arrays
 
 
 def _two_group_values(value_col, group_col, include_raw=False):
@@ -356,7 +834,7 @@ def _paired_values(col1, col2):
 
 def _paired_diff_values(column):
     plan = state.get_current_plan()
-    if column not in {"diff", "difference", "paired_diff"} or not plan or not plan.paired_columns:
+    if column not in {"diff", "difference", "paired_diff"} or not isinstance(plan, TwoGroupPlan) or not plan.paired_columns:
         return None
     x, y = _paired_values(plan.paired_columns[0], plan.paired_columns[1])
     return x - y
@@ -418,13 +896,63 @@ def _base_result(method, statistic, p_value, groups, x1, x2):
     }
 
 
-def _one_group_stats(values):
+def _multi_result(method, statistic, p_value, groups, arrays, effect_name, effect_value):
     return {
-        "n": int(len(values)),
-        "mean": float(values.mean()),
-        "std": float(values.std(ddof=1)),
-        "median": float(values.median()),
+        "method": method,
+        "statistic": float(statistic),
+        "p_value": float(p_value),
+        "effect_size": {"name": effect_name, "value": float(effect_value), "magnitude": _eta_magnitude(effect_value)},
+        "group_stats": {str(g): _one_group_stats(a) for g, a in zip(groups, arrays)},
+        "interpretation_hints": _generic_hints(float(p_value), "某些组之间有差异,需事后检验"),
     }
+
+
+def _correlation_result(method, x_col, y_col, func):
+    try:
+        plan = _guard(CorrelationPlan, f"run_{method}")
+        if isinstance(plan, dict):
+            return plan
+        df = _numeric_pair(x_col, y_col)
+        stat, p_value = func(df[x_col], df[y_col])
+        result = {
+            "method": method,
+            "statistic": float(stat),
+            "p_value": float(p_value),
+            "effect_size": {"name": f"{method}_r", "value": float(stat), "magnitude": _r_magnitude(stat)},
+            "group_stats": {"n": int(len(df)), "x": _one_group_stats(df[x_col]), "y": _one_group_stats(df[y_col])},
+            "interpretation_hints": _generic_hints(float(p_value), "变量之间存在相关关系"),
+        }
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _categorical_simple(method, statistic, p_value, table):
+    return {
+        "method": method,
+        "statistic": float(statistic),
+        "p_value": float(p_value),
+        "effect_size": {"name": "not_available", "value": None, "magnitude": "not_classified"},
+        "group_stats": {"observed": table.to_dict()},
+        "interpretation_hints": _generic_hints(float(p_value), "分类变量之间有关联"),
+    }
+
+
+def _numeric_pair(x_col, y_col):
+    df = _require_data()
+    pair = df[[x_col, y_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(pair) < 3:
+        raise ValueError("Correlation requires at least 3 complete numeric pairs.")
+    return pair
+
+
+def _one_group_stats(values):
+    return {"n": int(len(values)), "mean": float(values.mean()), "std": float(values.std(ddof=1)), "median": float(values.median())}
+
+
+def _group_stats(df, value_col, group_col):
+    return {str(g): _one_group_stats(pd.to_numeric(sub[value_col], errors="coerce").dropna()) for g, sub in df.groupby(group_col)}
 
 
 def _hints(p_value, diff_second_minus_first, n1, n2, groups=None):
@@ -434,11 +962,11 @@ def _hints(p_value, diff_second_minus_first, n1, n2, groups=None):
         direction = "after > before" if diff_second_minus_first > 0 else "before > after"
     else:
         direction = f"{groups[1]} > {groups[0]}" if diff_second_minus_first > 0 else f"{groups[0]} > {groups[1]}"
-    return {
-        "significant": bool(p_value < 0.05),
-        "direction": direction,
-        "practical_caveat": "样本量较小,结果需谨慎" if min(n1, n2) < 5 else None,
-    }
+    return {"significant": bool(p_value < 0.05), "direction": direction, "practical_caveat": "样本量较小,结果需谨慎" if min(n1, n2) < 5 else None}
+
+
+def _generic_hints(p_value, direction):
+    return {"significant": bool(p_value < 0.05), "direction": direction if p_value < 0.05 else "no_diff", "practical_caveat": None}
 
 
 def _cohens_magnitude(value):
@@ -463,6 +991,32 @@ def _r_magnitude(value):
     return "large"
 
 
+def _eta_magnitude(value):
+    value = abs(value)
+    if value < 0.01:
+        return "negligible"
+    if value < 0.06:
+        return "small"
+    if value < 0.14:
+        return "medium"
+    return "large"
+
+
+def _eta_squared_anova(arrays):
+    all_values = np.concatenate([np.asarray(a, dtype=float) for a in arrays])
+    grand_mean = all_values.mean()
+    ss_between = sum(len(a) * (a.mean() - grand_mean) ** 2 for a in arrays)
+    ss_total = sum((all_values - grand_mean) ** 2)
+    return float(ss_between / ss_total) if ss_total else 0.0
+
+
+def _cramers_v(chi2, table):
+    n = table.values.sum()
+    r, k = table.shape
+    denom = n * (min(k - 1, r - 1))
+    return float(math.sqrt(chi2 / denom)) if denom else 0.0
+
+
 def _store_result(result):
     plan = state.get_current_plan()
     if plan:
@@ -475,6 +1029,20 @@ def _store_plot(path):
         plan.plots.append(path)
 
 
+def _method_label():
+    plan = state.get_current_plan()
+    return plan.selected_method if plan and plan.selected_method else "preview"
+
+
+def _default_boxplot_path():
+    return f"output/boxplot_{_method_label()}_{datetime.now().strftime('%H%M%S')}.png"
+
+
+def _default_qq_path(group_value):
+    label = str(group_value) if group_value else "all"
+    return f"output/qq_{label}_{datetime.now().strftime('%H%M%S')}.png"
+
+
 def _output_path(save_path):
     path = save_path.replace("\\", "/")
     if not path.startswith("output/"):
@@ -483,12 +1051,19 @@ def _output_path(save_path):
     return path
 
 
-def _default_boxplot_path():
-    plan = state.get_current_plan()
-    method = plan.selected_method if plan and plan.selected_method else "preview"
-    return f"output/boxplot_{method}_{datetime.now().strftime('%H%M%S')}.png"
-
-
-def _default_qq_path(group_value):
-    label = str(group_value) if group_value else "all"
-    return f"output/qq_{label}_{datetime.now().strftime('%H%M%S')}.png"
+def _jsonable(value):
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, tuple):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if pd.isna(value) if not isinstance(value, (dict, list, tuple, np.ndarray)) else False:
+        return None
+    return value

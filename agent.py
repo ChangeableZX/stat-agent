@@ -111,7 +111,7 @@ TOOLS = [
         {"column": {"type": "string"}, "group_column": {"type": "string"}, "group_value": {"type": "string"}},
         ["column"],
     ),
-    _tool("check_variance_equality", "Run Levene's test.", {"value_col": {"type": "string"}, "group_col": {"type": "string"}}, ["value_col", "group_col"]),
+    _tool("check_variance_equality", "Run Levene's test. Use group_values to restrict to specific groups when the column has more than 2 groups.", {"value_col": {"type": "string"}, "group_col": {"type": "string"}, "group_values": {"type": "array", "items": {"type": "string"}}}, ["value_col", "group_col"]),
     _tool("check_sphericity", "Run Mauchly sphericity test.", {"subject_col": {"type": "string"}, "within_col": {"type": "string"}, "value_col": {"type": "string"}}, ["subject_col", "within_col", "value_col"]),
     _tool("check_bivariate_normality", "Check simplified bivariate normality.", {"x_col": {"type": "string"}, "y_col": {"type": "string"}}, ["x_col", "y_col"]),
     _tool("check_linearity", "Check simplified linearity.", {"x_col": {"type": "string"}, "y_col": {"type": "string"}}, ["x_col", "y_col"]),
@@ -128,9 +128,9 @@ TOOLS = [
     _tool("check_independence", "Compute Durbin-Watson regression diagnostic.", {"y_col": {"type": "string"}, "x_cols": {"type": "array", "items": {"type": "string"}}}, ["y_col", "x_cols"]),
     _tool("check_multicollinearity", "Compute VIF for regression predictors.", {"x_cols": {"type": "array", "items": {"type": "string"}}}, ["x_cols"]),
     _tool("check_outliers", "Check Cook's distance influential points.", {"y_col": {"type": "string"}, "x_cols": {"type": "array", "items": {"type": "string"}}}, ["y_col", "x_cols"]),
-    _tool("run_independent_ttest", "Run Student independent t-test.", {"value_column": {"type": "string"}, "group_column": {"type": "string"}, "equal_var": {"type": "boolean"}}, ["value_column", "group_column"]),
-    _tool("run_welch_ttest", "Run Welch independent t-test.", {"value_col": {"type": "string"}, "group_col": {"type": "string"}}, ["value_col", "group_col"]),
-    _tool("run_mannwhitney", "Run Mann-Whitney U test.", {"value_col": {"type": "string"}, "group_col": {"type": "string"}}, ["value_col", "group_col"]),
+    _tool("run_independent_ttest", "Run Student independent t-test. If the grouping column has more than 2 groups but the user wants to compare only 2 specific groups, pass group_values=[\"GroupA\", \"GroupB\"] to filter.", {"value_column": {"type": "string"}, "group_column": {"type": "string"}, "equal_var": {"type": "boolean"}, "group_values": {"type": "array", "items": {"type": "string"}}}, ["value_column", "group_column"]),
+    _tool("run_welch_ttest", "Run Welch independent t-test. Use group_values to filter to 2 specific groups when the column has more than 2 groups.", {"value_col": {"type": "string"}, "group_col": {"type": "string"}, "group_values": {"type": "array", "items": {"type": "string"}}}, ["value_col", "group_col"]),
+    _tool("run_mannwhitney", "Run Mann-Whitney U test. Use group_values to filter to 2 specific groups when the column has more than 2 groups.", {"value_col": {"type": "string"}, "group_col": {"type": "string"}, "group_values": {"type": "array", "items": {"type": "string"}}}, ["value_col", "group_col"]),
     _tool("run_paired_ttest", "Run paired t-test.", {"col1": {"type": "string"}, "col2": {"type": "string"}}, ["col1", "col2"]),
     _tool("run_wilcoxon", "Run Wilcoxon signed-rank test.", {"col1": {"type": "string"}, "col2": {"type": "string"}}, ["col1", "col2"]),
     _tool("run_one_way_anova", "Run one-way ANOVA.", {"value_col": {"type": "string"}, "group_col": {"type": "string"}}, ["value_col", "group_col"]),
@@ -345,7 +345,7 @@ def run_agent_with_callbacks(
                 messages.append(
                     {
                         "role": "user",
-                        "content": f"[StatPlan 褰撳墠鐘舵€乚\n\n{state.current_plan.summary()}",
+                        "content": f"[StatPlan 当前状态]\n\n{state.current_plan.summary()}",
                     }
                 )
                 if on_plan_update:

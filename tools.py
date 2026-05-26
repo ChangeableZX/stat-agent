@@ -150,6 +150,34 @@ def load_data(file_path: str):
                 table = pd.crosstab(df[plan.row_variable], df[plan.col_variable])
                 plan.table_shape = tuple(table.shape)
                 plan.sample_sizes = {"rows": int(table.shape[0]), "cols": int(table.shape[1]), "n": int(table.values.sum())}
+
+            # 提前验证计划变量是否存在于数据中
+            missing_vars = []
+            if isinstance(plan, TwoGroupPlan):
+                for col in [plan.target_variable, plan.grouping_variable]:
+                    if col and col not in df.columns:
+                        missing_vars.append(col)
+            elif isinstance(plan, MultiGroupPlan):
+                for col in [plan.target_variable, plan.grouping_variable]:
+                    if col and col not in df.columns:
+                        missing_vars.append(col)
+            elif isinstance(plan, CorrelationPlan):
+                for col in [plan.x_variable, plan.y_variable]:
+                    if col and col not in df.columns:
+                        missing_vars.append(col)
+            elif isinstance(plan, RegressionPlan):
+                for col in [plan.y_variable] + list(plan.x_variables or []):
+                    if col and col not in df.columns:
+                        missing_vars.append(col)
+            elif isinstance(plan, CategoricalPlan):
+                for col in [plan.row_variable, plan.col_variable]:
+                    if col and col not in df.columns:
+                        missing_vars.append(col)
+            if missing_vars:
+                result["plan_variable_warning"] = (
+                    f"[警告] 计划中的以下变量在数据中不存在: {missing_vars}。"
+                    f"请停止分析并告知用户列名有误。数据实际列名为: {list(df.columns)}"
+                )
         return result
     except Exception as exc:
         return {"error": str(exc)}
@@ -201,10 +229,10 @@ def check_normality(column: str, group_column: str = None, group_value: str = No
         return {"error": str(exc)}
 
 
-def check_variance_equality(value_col: str, group_col: str):
-    """Run Levene's test for equal variance across two or more groups."""
+def check_variance_equality(value_col: str, group_col: str, group_values: list = None):
+    """Run Levene's test for equal variance across two or more groups. Use group_values to restrict to specific groups."""
     try:
-        groups, arrays = _group_arrays(value_col, group_col)
+        groups, arrays = _group_arrays(value_col, group_col, group_filter=group_values)
         stat, p_value = stats.levene(*arrays)
         result = {
             "statistic": float(stat),
@@ -638,13 +666,13 @@ def power_analysis_correlation(r=None, alpha=0.05, power=0.8, n=None):
         return {"error": str(exc)}
 
 
-def run_independent_ttest(value_column: str, group_column: str, equal_var: bool = True):
-    """Run an independent-samples t-test for exactly two groups and return effect size and CI."""
+def run_independent_ttest(value_column: str, group_column: str, equal_var: bool = True, group_values: list = None):
+    """Run an independent-samples t-test for exactly two groups. Use group_values to filter when column has more than 2 groups."""
     try:
         plan = state.get_current_plan()
         if plan is not None and not isinstance(plan, TwoGroupPlan):
             return {"error": f"run_independent_ttest 要求 TwoGroupPlan,当前是 {type(plan).__name__}"}
-        groups, x1, x2, raw1, raw2 = _two_group_values(value_column, group_column, include_raw=True)
+        groups, x1, x2, raw1, raw2 = _two_group_values(value_column, group_column, include_raw=True, group_filter=group_values)
         result = _independent_ttest_result(groups, x1, x2, raw1, raw2, equal_var)
         _store_result(result)
         return result
@@ -652,18 +680,18 @@ def run_independent_ttest(value_column: str, group_column: str, equal_var: bool 
         return {"error": str(exc)}
 
 
-def run_welch_ttest(value_col: str, group_col: str):
-    """Run Welch's independent-samples t-test."""
-    return run_independent_ttest(value_col, group_col, equal_var=False)
+def run_welch_ttest(value_col: str, group_col: str, group_values: list = None):
+    """Run Welch's independent-samples t-test. Use group_values to filter when column has more than 2 groups."""
+    return run_independent_ttest(value_col, group_col, equal_var=False, group_values=group_values)
 
 
-def run_mannwhitney(value_col: str, group_col: str):
-    """Run Mann-Whitney U test for two independent groups."""
+def run_mannwhitney(value_col: str, group_col: str, group_values: list = None):
+    """Run Mann-Whitney U test for two independent groups. Use group_values to filter when column has more than 2 groups."""
     try:
         plan = _guard(TwoGroupPlan, "run_mannwhitney")
         if isinstance(plan, dict):
             return plan
-        groups, x1, x2, raw1, raw2 = _two_group_values(value_col, group_col, include_raw=True)
+        groups, x1, x2, raw1, raw2 = _two_group_values(value_col, group_col, include_raw=True, group_filter=group_values)
         u_stat, p_value = stats.mannwhitneyu(x1, x2, alternative="two-sided")
         n1, n2 = len(x1), len(x2)
         mean_u = n1 * n2 / 2
@@ -1244,12 +1272,16 @@ def _require_data():
     return _DATA_CACHE
 
 
-def _group_arrays(value_col, group_col):
+def _group_arrays(value_col, group_col, group_filter=None):
     df = _require_data()
     if value_col not in df.columns:
         raise ValueError(f"Value column not found: {value_col}")
     if group_col not in df.columns:
         raise ValueError(f"Group column not found: {group_col}")
+    if group_filter:
+        df = df[df[group_col].isin(group_filter)]
+        if df.empty:
+            raise ValueError(f"group_values={group_filter} 过滤后数据为空,请检查组名是否与数据匹配。")
     groups = [g for g in df[group_col].dropna().unique().tolist()]
     arrays = [pd.to_numeric(df[df[group_col] == g][value_col], errors="coerce").dropna() for g in groups]
     if any(len(a) < 2 for a in arrays):
@@ -1257,12 +1289,16 @@ def _group_arrays(value_col, group_col):
     return groups, arrays
 
 
-def _two_group_values(value_col, group_col, include_raw=False):
+def _two_group_values(value_col, group_col, include_raw=False, group_filter=None):
     df = _require_data()
     if value_col not in df.columns:
         raise ValueError(f"Value column not found: {value_col}")
     if group_col not in df.columns:
         raise ValueError(f"Group column not found: {group_col}")
+    if group_filter:
+        df = df[df[group_col].isin(group_filter)]
+        if df.empty:
+            raise ValueError(f"group_values={group_filter} 过滤后数据为空,请检查组名是否与数据匹配。")
     groups = [g for g in df[group_col].dropna().unique().tolist()]
     group_counts = df[group_col].dropna().astype(str).value_counts().to_dict()
     if len(groups) != 2:

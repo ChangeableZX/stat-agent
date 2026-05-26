@@ -32,7 +32,7 @@ def main():
     assert result["intent"] == "compare_multi_groups"
 
     print("\nIntent routing test 3: invalid intent")
-    result = make_analysis_plan("坏意图", "regression", target_variable="y")
+    result = make_analysis_plan("坏意图", "not_a_real_intent", target_variable="y")
     print(result)
     assert "error" in result and "intent 必须" in result["error"]
     print("PASS")

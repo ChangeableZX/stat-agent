@@ -1,4 +1,4 @@
-from state import CategoricalPlan, CorrelationPlan, MultiGroupPlan, StatPlan, TwoGroupPlan
+from state import CategoricalPlan, CorrelationPlan, MultiGroupPlan, RegressionPlan, StatPlan, TwoGroupPlan
 
 
 def select_method(plan: StatPlan) -> StatPlan:
@@ -10,6 +10,8 @@ def select_method(plan: StatPlan) -> StatPlan:
         return select_method_for_correlation(plan)
     if isinstance(plan, CategoricalPlan):
         return select_method_for_categorical(plan)
+    if isinstance(plan, RegressionPlan):
+        return select_method_for_regression(plan)
     raise TypeError(f"Unknown plan type: {type(plan)}")
 
 
@@ -152,4 +154,70 @@ def select_method_for_categorical(plan: CategoricalPlan) -> CategoricalPlan:
     else:
         plan.selected_method = "fisher_freeman_halton"
         plan.method_rationale = ["R×C + ≥ 20% 格子低频", "→ fisher_freeman_halton"]
+    return plan
+
+
+def select_method_for_regression(plan: RegressionPlan) -> RegressionPlan:
+    if plan.intent != "regression":
+        raise ValueError(f"Unsupported intent: {plan.intent}")
+    if plan.regression_type != "linear":
+        raise ValueError("Only linear regression is supported in this round.")
+    if not plan.x_variables:
+        raise ValueError("Regression requires at least one x variable.")
+
+    if len(plan.x_variables) == 1:
+        plan.selected_method = "simple_linear_regression"
+        plan.method_rationale = ["linear regression + one predictor", "-> simple_linear_regression"]
+    else:
+        plan.selected_method = "multiple_linear_regression"
+        plan.method_rationale = ["linear regression + multiple predictors", "-> multiple_linear_regression"]
+    return plan
+
+
+def select_final_model(plan: RegressionPlan) -> RegressionPlan:
+    if not isinstance(plan, RegressionPlan):
+        raise TypeError(f"select_final_model requires RegressionPlan, got {type(plan).__name__}")
+
+    diagnostics = plan.diagnostics or {}
+    normality = diagnostics.get("residual_normality", {})
+    homoscedasticity = diagnostics.get("homoscedasticity", {})
+    multicollinearity = diagnostics.get("multicollinearity", {})
+    independence = diagnostics.get("independence", {})
+    outliers = diagnostics.get("outliers", {})
+
+    normal_passed = normality.get("passed", True)
+    homo_passed = homoscedasticity.get("passed", True)
+    multi_passed = multicollinearity.get("passed", True)
+    independent_passed = independence.get("passed", True)
+    outlier_passed = outliers.get("passed", True)
+    max_vif = float(multicollinearity.get("max_vif", 0) or 0)
+
+    failed = [
+        not normal_passed,
+        not homo_passed,
+        not multi_passed,
+        not independent_passed,
+        not outlier_passed,
+    ]
+
+    plan.transformations = []
+    if max_vif > 10 or not multi_passed:
+        plan.final_model = "ols_drop_collinear"
+        plan.method_rationale = ["存在多重共线性,建议删除高 VIF 变量"]
+    elif not normal_passed and not homo_passed:
+        plan.final_model = "ols_log_y"
+        plan.transformations.append({"type": "log_y", "reason": "残差非正态+异方差"})
+        plan.method_rationale = ["残差非正态+异方差,对 Y 取对数后重新拟合"]
+    elif normal_passed and not homo_passed:
+        plan.final_model = "ols_robust_se"
+        plan.method_rationale = ["残差正态 + 异方差,使用 White 稳健标准误"]
+    elif sum(bool(item) for item in failed) >= 3:
+        plan.final_model = "flag_for_glm"
+        plan.method_rationale = ["严重违反 OLS 假设,建议改用 GLM"]
+    elif not any(failed):
+        plan.final_model = "ols"
+        plan.method_rationale = ["诊断全通过,采用 OLS"]
+    else:
+        plan.final_model = "ols"
+        plan.method_rationale = ["存在轻微诊断提醒,当前仍采用 OLS 并在解释中提示"]
     return plan

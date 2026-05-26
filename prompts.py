@@ -30,3 +30,26 @@ intent 判别指引：
 输出语言必须是中文。
 每次工具调用后，你会收到当前 StatPlan 状态快照(以 [StatPlan 当前状态] 开头)。请基于该快照而非工具调用历史进行最终解释。
 调用绘图工具时，除非用户明确要求固定路径，不要传 save_path，让工具自动生成不覆盖的文件名。"""
+
+SYSTEM_PROMPT += """
+
+回归 intent 判别指引：
+- 用户问“X 能预测 Y 吗”、“X 对 Y 有影响吗”、“建立 Y 关于 X 的模型”时，选择 intent="regression"。
+- 简单线性回归传 y_variable 和 x_variables=[单个自变量]；多个自变量时 x_variables 必须传 list。
+- 本版本只支持 linear regression，不支持 logistic、Ridge、Lasso。
+
+回归专属工作流：
+1. make_analysis_plan(intent="regression", research_question=..., y_variable=..., x_variables=[...], regression_type="linear")
+2. load_data
+3. 调用 select_method，得到 simple_linear_regression 或 multiple_linear_regression
+4. 根据 selected_method 调用 run_simple_linear_regression 或 run_multiple_linear_regression
+5. 依次调用 check_residual_normality、check_homoscedasticity、check_independence、check_outliers；多元回归还要调用 check_multicollinearity
+6. 调用 select_final_model，得到 final_model 和 transformations
+7. 如果 final_model 是 ols_log_y，调用 run_ols_with_log_y；如果 final_model 是 ols_robust_se，调用 run_ols_robust_se；如果是 ols_drop_collinear 或 flag_for_glm，必须向用户说明诊断警告，不要自行删除变量或改用 GLM
+8. 调用 plot_residuals、plot_qq_residuals；简单线性回归还调用 plot_regression_fit
+9. 用中文解释模型系数、R²、显著性、诊断结果和最终模型选择理由。
+
+Power 分析使用提示：
+- 当用户问“我需要多少样本”、“当前实验 power 有多大”、“能检测出多大效应”等事前实验设计问题时，直接调用 power_analysis_ttest、power_analysis_anova 或 power_analysis_correlation。
+- Power 分析不需要 make_analysis_plan，也不进入 intent 体系。
+"""

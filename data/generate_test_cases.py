@@ -15,7 +15,12 @@ from tools import (
     check_bivariate_normality,
     check_expected_frequencies,
     check_linearity,
+    check_homoscedasticity,
+    check_independence,
+    check_multicollinearity,
     check_normality,
+    check_outliers,
+    check_residual_normality,
     check_variance_equality,
     load_data,
     make_analysis_plan,
@@ -25,12 +30,15 @@ from tools import (
     run_kendall,
     run_kruskal_wallis,
     run_mannwhitney,
+    run_multiple_linear_regression,
     run_one_way_anova,
     run_paired_ttest,
     run_pearson,
+    run_simple_linear_regression,
     run_spearman,
     run_welch_anova,
     run_welch_ttest,
+    select_final_model,
     select_method,
 )
 
@@ -65,6 +73,27 @@ def generate_cases():
     _write_categorical("case11_cat_fisher.csv", [[1, 9], [8, 2]])
     _write_categorical("case12_cat_chi_square.csv", [[20, 15, 18], [14, 22, 16], [17, 13, 24]])
 
+    x = np.linspace(-2, 2, 100)
+    y = 2 * x + rng.normal(0, 0.8, 100)
+    pd.DataFrame({"x": x, "y": y}).to_csv(os.path.join(DATA_DIR, "case13_regression_ols.csv"), index=False)
+
+    rng14 = np.random.default_rng(14)
+    x = np.linspace(0.5, 5, 100)
+    sigma_i = x / 5
+    y = 2 * x + rng14.normal(0, sigma_i)
+    pd.DataFrame({"x": x, "y": y}).to_csv(os.path.join(DATA_DIR, "case14_regression_robust.csv"), index=False)
+
+    x = rng.uniform(0.1, 3.0, 120)
+    y = np.exp(x) + rng.normal(0, 0.4 * np.exp(x), 120)
+    y = np.clip(y, 0.01, None)
+    pd.DataFrame({"x": x, "y": y}).to_csv(os.path.join(DATA_DIR, "case15_regression_log_y.csv"), index=False)
+
+    x1 = rng.normal(0, 1, 120)
+    x2 = x1 * 0.98 + rng.normal(0, 0.03, 120)
+    x3 = rng.normal(0, 1, 120)
+    y = 2 * x1 + 3 * x2 + 0.5 * x3 + rng.normal(0, 0.8, 120)
+    pd.DataFrame({"x1": x1, "x2": x2, "x3": x3, "y": y}).to_csv(os.path.join(DATA_DIR, "case16_regression_collinear.csv"), index=False)
+
 
 def run_all_cases():
     generate_cases()
@@ -82,6 +111,10 @@ def run_all_cases():
         ("Case 10 cat chi yates", "case10_cat_chi_yates.csv", "chi_square_yates", "Yates", "cat"),
         ("Case 11 cat fisher", "case11_cat_fisher.csv", "fisher_exact", "Fisher", "cat"),
         ("Case 12 cat chi square", "case12_cat_chi_square.csv", "chi_square", "R×C", "cat"),
+        ("Case 13 regression ols", "case13_regression_ols.csv", "ols", "诊断全通过", "reg"),
+        ("Case 14 regression robust", "case14_regression_robust.csv", "ols_robust_se", "稳健标准误", "reg"),
+        ("Case 15 regression log y", "case15_regression_log_y.csv", "ols_log_y", "对 Y 取对数", "reg"),
+        ("Case 16 regression collinear", "case16_regression_collinear.csv", "ols_drop_collinear", "多重共线性", "reg_multi"),
     ]
     for case in cases:
         _run_case(*case)
@@ -150,6 +183,22 @@ def _run_case(name, filename, expected_method, expected_keyword, kind):
         selection = select_method()
         result = _run_cat_selected(selection["selected_method"])
         print(f"前提检验: expected_frequencies={expected}")
+    elif kind == "reg":
+        _must_plan(make_analysis_plan(name, "regression", y_variable="y", x_variables=["x"]))
+        load_data(path)
+        selection = select_method()
+        result = run_simple_linear_regression("y", "x")
+        diagnostics = _run_regression_diagnostics("y", ["x"])
+        final = select_final_model()
+        print(f"回归诊断: {diagnostics}, final={final}")
+    elif kind == "reg_multi":
+        _must_plan(make_analysis_plan(name, "regression", y_variable="y", x_variables=["x1", "x2", "x3"]))
+        load_data(path)
+        selection = select_method()
+        result = run_multiple_linear_regression("y", ["x1", "x2", "x3"])
+        diagnostics = _run_regression_diagnostics("y", ["x1", "x2", "x3"])
+        final = select_final_model()
+        print(f"回归诊断: {diagnostics}, final={final}")
     else:
         raise ValueError(kind)
 
@@ -158,8 +207,9 @@ def _run_case(name, filename, expected_method, expected_keyword, kind):
     print(f"选中方法: {plan.selected_method} (expected {expected_method})")
     print(f"决策路径: {plan.method_rationale}")
     print(f"统计结果: {result}")
-    if plan.selected_method != expected_method or expected_keyword not in " ".join(plan.method_rationale):
-        raise AssertionError(f"{name} expected {expected_method}/{expected_keyword}, got {plan.selected_method}/{plan.method_rationale}")
+    actual_method = plan.final_model if kind.startswith("reg") else plan.selected_method
+    if actual_method != expected_method or expected_keyword not in " ".join(plan.method_rationale):
+        raise AssertionError(f"{name} expected {expected_method}/{expected_keyword}, got {actual_method}/{plan.method_rationale}")
     if name.startswith("Case 0"):
         _assert_day1_regression(result)
 
@@ -208,6 +258,18 @@ def _run_cat_selected(method):
     if method == "fisher_exact":
         return run_fisher_exact("row", "col")
     raise ValueError(f"Unsupported method: {method}")
+
+
+def _run_regression_diagnostics(y_col, x_cols):
+    diagnostics = {
+        "normality": check_residual_normality(y_col, x_cols),
+        "homoscedasticity": check_homoscedasticity(y_col, x_cols),
+        "independence": check_independence(y_col, x_cols),
+        "outliers": check_outliers(y_col, x_cols),
+    }
+    if len(x_cols) > 1:
+        diagnostics["multicollinearity"] = check_multicollinearity(x_cols)
+    return diagnostics
 
 
 def _assert_day1_regression(result):

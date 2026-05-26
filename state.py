@@ -191,7 +191,45 @@ class CategoricalPlan(StatPlan):
         return data
 
 
-PlanType = Union[TwoGroupPlan, MultiGroupPlan, CorrelationPlan, CategoricalPlan]
+@dataclass
+class RegressionPlan(StatPlan):
+    y_variable: str = ""
+    x_variables: list = field(default_factory=list)
+    regression_type: str = "linear"
+    diagnostics: dict = field(default_factory=dict)
+    transformations: list = field(default_factory=list)
+    final_model: Optional[str] = None
+
+    def summary(self) -> str:
+        lines = self._base_lines()
+        insert = [
+            f"**Y 变量**: {self.y_variable}",
+            f"**X 变量**: {self.x_variables}",
+            f"**回归类型**: {self.regression_type}",
+        ]
+        if self.diagnostics:
+            insert.append(f"**回归诊断**: {self.diagnostics}")
+        if self.transformations:
+            insert.append(f"**修正轨迹**: {self.transformations}")
+        if self.final_model:
+            insert.append(f"**最终模型**: {self.final_model}")
+        return "\n".join(lines[:4] + insert + lines[4:])
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        data.update({
+            "y_variable": self.y_variable,
+            "x_variables": self.x_variables,
+            "regression_type": self.regression_type,
+            "diagnostics": self.diagnostics,
+            "transformations": self.transformations,
+            "final_model": self.final_model,
+            "summary": self.summary(),
+        })
+        return data
+
+
+PlanType = Union[TwoGroupPlan, MultiGroupPlan, CorrelationPlan, CategoricalPlan, RegressionPlan]
 current_plan: Optional[PlanType] = None
 
 

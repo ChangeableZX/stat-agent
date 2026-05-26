@@ -5,10 +5,16 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from scipy import stats
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.outliers_influence import OLSInfluence, variance_inflation_factor
+from statsmodels.stats.power import FTestAnovaPower, TTestIndPower
+from statsmodels.stats.stattools import durbin_watson
 
 import state
+from decision import select_final_model as route_select_final_model
 from decision import select_method as route_select_method
-from state import CategoricalPlan, CorrelationPlan, MultiGroupPlan, TwoGroupPlan
+from state import CategoricalPlan, CorrelationPlan, MultiGroupPlan, RegressionPlan, TwoGroupPlan
 
 
 _DATA_CACHE = None
@@ -18,7 +24,7 @@ _MISSING_MARKERS = {"", "na", "n/a", "nan", "null", "none"}
 def make_analysis_plan(research_question: str, intent: str, **kwargs):
     """Create the correct StatPlan subclass after validating intent-specific fields."""
     try:
-        valid_intents = ["compare_two_groups", "compare_multi_groups", "correlation", "categorical_test"]
+        valid_intents = ["compare_two_groups", "compare_multi_groups", "correlation", "categorical_test", "regression"]
         if intent not in valid_intents:
             return {"error": f"intent 必须是 {valid_intents} 之一,得到 '{intent}'"}
         missing = []
@@ -35,6 +41,8 @@ def make_analysis_plan(research_question: str, intent: str, **kwargs):
             missing += _missing(kwargs, ["x_variable", "y_variable"])
         elif intent == "categorical_test":
             missing += _missing(kwargs, ["row_variable", "col_variable"])
+        elif intent == "regression":
+            missing += _missing(kwargs, ["y_variable", "x_variables"])
         if missing:
             return {"error": f"make_analysis_plan 缺少字段: {missing}. 请补全后重试。"}
 
@@ -67,7 +75,7 @@ def make_analysis_plan(research_question: str, intent: str, **kwargs):
                 x_type=kwargs.get("x_type", "continuous"),
                 y_type=kwargs.get("y_type", "continuous"),
             )
-        else:
+        elif intent == "categorical_test":
             plan = CategoricalPlan(
                 research_question=research_question,
                 intent=intent,
@@ -75,8 +83,26 @@ def make_analysis_plan(research_question: str, intent: str, **kwargs):
                 col_variable=kwargs["col_variable"],
                 paired=bool(kwargs.get("paired", False)),
             )
+        else:
+            x_variables = kwargs["x_variables"]
+            warning = None
+            if isinstance(x_variables, str):
+                x_variables = [x_variables]
+                warning = "x_variables received as string and was converted to a one-item list."
+            if not isinstance(x_variables, list) or not all(isinstance(item, str) and item for item in x_variables):
+                return {"error": "x_variables 必须是非空字符串列表。"}
+            plan = RegressionPlan(
+                research_question=research_question,
+                intent=intent,
+                y_variable=kwargs["y_variable"],
+                x_variables=x_variables,
+                regression_type=kwargs.get("regression_type", "linear"),
+            )
         state.set_current_plan(plan)
-        return plan.to_dict()
+        result = plan.to_dict()
+        if intent == "regression" and warning:
+            result["warning"] = warning
+        return result
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -300,6 +326,314 @@ def select_method():
         plan = route_select_method(plan)
         state.set_current_plan(plan)
         return {"selected_method": plan.selected_method, "method_rationale": plan.method_rationale, "plan_summary": plan.summary()}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_simple_linear_regression(y_col: str, x_col: str):
+    """Run simple OLS regression with one predictor."""
+    try:
+        plan = _guard(RegressionPlan, "run_simple_linear_regression")
+        if isinstance(plan, dict):
+            return plan
+        result = _run_regression("simple_linear_regression", y_col, [x_col])
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_multiple_linear_regression(y_col: str, x_cols: list):
+    """Run multiple OLS regression with two or more predictors."""
+    try:
+        plan = _guard(RegressionPlan, "run_multiple_linear_regression")
+        if isinstance(plan, dict):
+            return plan
+        result = _run_regression("multiple_linear_regression", y_col, _as_list(x_cols))
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_ols_with_log_y(y_col: str, x_cols: list):
+    """Fit OLS after log-transforming Y."""
+    try:
+        plan = _guard(RegressionPlan, "run_ols_with_log_y")
+        if isinstance(plan, dict):
+            return plan
+        result = _run_regression("ols_log_y", y_col, _as_list(x_cols), log_y=True)
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_ols_robust_se(y_col: str, x_cols: list):
+    """Fit OLS and report HC3 robust standard errors and p-values."""
+    try:
+        plan = _guard(RegressionPlan, "run_ols_robust_se")
+        if isinstance(plan, dict):
+            return plan
+        result = _run_regression("ols_robust_se", y_col, _as_list(x_cols), robust_cov="HC3")
+        _store_result(result)
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def select_final_model():
+    """Select the final regression model after diagnostics have been written to RegressionPlan."""
+    try:
+        plan = _guard(RegressionPlan, "select_final_model")
+        if isinstance(plan, dict):
+            return plan
+        plan = route_select_final_model(plan)
+        state.set_current_plan(plan)
+        return {
+            "final_model": plan.final_model,
+            "transformations": plan.transformations,
+            "method_rationale": plan.method_rationale,
+            "plan_summary": plan.summary(),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_residual_normality(y_col: str, x_cols: list):
+    """Run Shapiro-Wilk normality test on OLS residuals."""
+    try:
+        plan = _guard(RegressionPlan, "check_residual_normality")
+        if isinstance(plan, dict):
+            return plan
+        model = _fit_ols(y_col, _as_list(x_cols))
+        stat, p_value = stats.shapiro(model.resid)
+        result = {
+            "test": "shapiro_residuals",
+            "statistic": float(stat),
+            "p_value": float(p_value),
+            "passed": bool(p_value >= 0.05),
+            "interpretation_hints": _generic_hints(float(p_value), "残差偏离正态"),
+        }
+        plan.diagnostics["residual_normality"] = {"passed": result["passed"], "p": result["p_value"]}
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_homoscedasticity(y_col: str, x_cols: list):
+    """Run Breusch-Pagan test for homoscedasticity."""
+    try:
+        plan = _guard(RegressionPlan, "check_homoscedasticity")
+        if isinstance(plan, dict):
+            return plan
+        model = _fit_ols(y_col, _as_list(x_cols))
+        lm_stat, lm_p, f_stat, f_p = het_breuschpagan(model.resid, model.model.exog)
+        result = {
+            "test": "breusch_pagan",
+            "statistic": float(lm_stat),
+            "p_value": float(lm_p),
+            "f_statistic": float(f_stat),
+            "f_p_value": float(f_p),
+            "passed": bool(lm_p >= 0.05),
+            "interpretation_hints": _generic_hints(float(lm_p), "存在异方差"),
+        }
+        plan.diagnostics["homoscedasticity"] = {"passed": result["passed"], "p": result["p_value"], "test": "breusch_pagan"}
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_independence(y_col: str, x_cols: list):
+    """Compute Durbin-Watson statistic for residual independence."""
+    try:
+        plan = _guard(RegressionPlan, "check_independence")
+        if isinstance(plan, dict):
+            return plan
+        model = _fit_ols(y_col, _as_list(x_cols))
+        dw = float(durbin_watson(model.resid))
+        result = {
+            "test": "durbin_watson",
+            "statistic": dw,
+            "dw_statistic": dw,
+            "passed": bool(1.5 <= dw <= 2.5),
+            "interpretation_hints": {"practical_caveat": "Durbin-Watson 接近 2 表示残差独立性较好。"},
+        }
+        plan.diagnostics["independence"] = {"passed": result["passed"], "dw_statistic": dw}
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_multicollinearity(x_cols: list):
+    """Compute VIF values for multiple regression predictors."""
+    try:
+        plan = _guard(RegressionPlan, "check_multicollinearity")
+        if isinstance(plan, dict):
+            return plan
+        x_cols = _as_list(x_cols)
+        if len(x_cols) <= 1:
+            result = {"test": "vif", "vif": {}, "max_vif": 0.0, "passed": True, "interpretation_hints": {"practical_caveat": "单自变量无需 VIF 诊断。"}}
+            plan.diagnostics["multicollinearity"] = {"passed": True, "max_vif": 0.0}
+            return result
+        x = _regression_frame(None, x_cols, require_y=False)[x_cols]
+        exog = sm.add_constant(x, has_constant="add")
+        vif = {col: float(variance_inflation_factor(exog.values, idx + 1)) for idx, col in enumerate(x_cols)}
+        max_vif = max(vif.values()) if vif else 0.0
+        result = {
+            "test": "vif",
+            "vif": vif,
+            "max_vif": float(max_vif),
+            "passed": bool(max_vif <= 10),
+            "interpretation_hints": {"practical_caveat": "VIF > 10 通常提示严重多重共线性。"},
+        }
+        plan.diagnostics["multicollinearity"] = {"passed": result["passed"], "max_vif": float(max_vif)}
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def check_outliers(y_col: str, x_cols: list):
+    """Count influential observations using Cook's distance > 4/n."""
+    try:
+        plan = _guard(RegressionPlan, "check_outliers")
+        if isinstance(plan, dict):
+            return plan
+        model = _fit_ols(y_col, _as_list(x_cols))
+        cooks_d = OLSInfluence(model).cooks_distance[0]
+        threshold = 4 / len(cooks_d)
+        n_influential = int(np.sum(cooks_d > threshold))
+        allowed = max(1, int(0.05 * len(cooks_d)))
+        result = {
+            "test": "cooks_distance",
+            "statistic": float(np.max(cooks_d)),
+            "threshold": float(threshold),
+            "n_influential": n_influential,
+            "max_cooks_d": float(np.max(cooks_d)),
+            "passed": bool(n_influential <= allowed),
+            "interpretation_hints": {"practical_caveat": "Cook's D > 4/n 的点需要人工复核。"},
+        }
+        plan.diagnostics["outliers"] = {"passed": result["passed"], "n_influential": n_influential, "max_cooks_d": result["max_cooks_d"]}
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def plot_residuals(y_col: str, x_cols: list):
+    """Save residuals vs fitted values plot for regression."""
+    try:
+        plan = _guard(RegressionPlan, "plot_residuals")
+        if isinstance(plan, dict):
+            return plan
+        import matplotlib.pyplot as plt
+
+        model = _fit_ols(y_col, _as_list(x_cols))
+        path = f"output/residuals_{_method_label()}_{datetime.now().strftime('%H%M%S')}.png"
+        os.makedirs("output", exist_ok=True)
+        plt.figure(figsize=(6, 4))
+        plt.scatter(model.fittedvalues, model.resid, alpha=0.75)
+        plt.axhline(0, color="black", linewidth=1)
+        plt.xlabel("Fitted values")
+        plt.ylabel("Residuals")
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+        _store_plot(path)
+        return {"plot_path": path, "saved_to": path}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def plot_qq_residuals(y_col: str, x_cols: list):
+    """Save residual Q-Q plot for regression."""
+    try:
+        plan = _guard(RegressionPlan, "plot_qq_residuals")
+        if isinstance(plan, dict):
+            return plan
+        import matplotlib.pyplot as plt
+
+        model = _fit_ols(y_col, _as_list(x_cols))
+        path = f"output/qq_residuals_{_method_label()}_{datetime.now().strftime('%H%M%S')}.png"
+        os.makedirs("output", exist_ok=True)
+        plt.figure(figsize=(5, 5))
+        stats.probplot(model.resid, dist="norm", plot=plt)
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+        _store_plot(path)
+        return {"plot_path": path, "saved_to": path}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def plot_regression_fit(y_col: str, x_col: str):
+    """Save simple linear regression scatter plot with fitted line."""
+    try:
+        plan = _guard(RegressionPlan, "plot_regression_fit")
+        if isinstance(plan, dict):
+            return plan
+        import matplotlib.pyplot as plt
+
+        df = _regression_frame(y_col, [x_col])
+        model = _fit_ols(y_col, [x_col])
+        xs = np.linspace(df[x_col].min(), df[x_col].max(), 100)
+        pred = model.params["const"] + model.params[x_col] * xs
+        path = f"output/regression_fit_{_method_label()}_{datetime.now().strftime('%H%M%S')}.png"
+        os.makedirs("output", exist_ok=True)
+        plt.figure(figsize=(6, 4))
+        plt.scatter(df[x_col], df[y_col], alpha=0.75)
+        plt.plot(xs, pred, color="black", linewidth=1.5)
+        plt.xlabel(x_col)
+        plt.ylabel(y_col)
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+        _store_plot(path)
+        return {"plot_path": path, "saved_to": path}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def power_analysis_ttest(effect_size=None, alpha=0.05, power=0.8, n=None):
+    """Solve two-sample t-test power, sample size per group, or effect size."""
+    try:
+        computed = _missing_power_target(effect_size, alpha, power, n)
+        analysis = TTestIndPower()
+        value = analysis.solve_power(effect_size=effect_size, nobs1=n, alpha=alpha, power=power, ratio=1.0, alternative="two-sided")
+        return _power_result(computed, value, {"effect_size": effect_size, "alpha": alpha, "power": power, "n": n}, "two-sample t-test")
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def power_analysis_anova(effect_size=None, n_groups=None, alpha=0.05, power=0.8, n=None):
+    """Solve one-way ANOVA power. n is interpreted as per-group sample size."""
+    try:
+        if n_groups is None:
+            return {"error": "n_groups is required for ANOVA power analysis."}
+        computed = _missing_power_target(effect_size, alpha, power, n)
+        analysis = FTestAnovaPower()
+        nobs = None if n is None else n * n_groups
+        value = analysis.solve_power(effect_size=effect_size, nobs=nobs, alpha=alpha, power=power, k_groups=n_groups)
+        if computed == "n":
+            value = value / n_groups
+        return _power_result(computed, value, {"effect_size": effect_size, "n_groups": n_groups, "alpha": alpha, "power": power, "n": n}, "one-way ANOVA")
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def power_analysis_correlation(r=None, alpha=0.05, power=0.8, n=None):
+    """Approximate Pearson correlation power using Fisher z transformation."""
+    try:
+        computed = _missing_power_target(r, alpha, power, n, effect_name="r")
+        if computed == "power":
+            value = _correlation_power(r, alpha, n)
+        elif computed == "n":
+            value = _solve_correlation_n(r, alpha, power)
+        elif computed == "r":
+            value = _solve_correlation_r(alpha, power, n)
+        else:
+            return {"error": "Solving alpha for correlation power is not supported."}
+        return _power_result(computed, value, {"r": r, "alpha": alpha, "power": power, "n": n}, "Pearson correlation")
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -769,6 +1103,128 @@ def plot_mosaic(row_col: str, col_col: str):
         return {"plot_path": path, "saved_to": path}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def _as_list(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _regression_frame(y_col, x_cols, require_y=True, log_y=False):
+    df = _require_data()
+    x_cols = _as_list(x_cols)
+    if not x_cols:
+        raise ValueError("Regression requires at least one x column.")
+    missing = [col for col in x_cols if col not in df.columns]
+    if require_y and y_col not in df.columns:
+        missing.append(y_col)
+    if missing:
+        raise ValueError(f"Column(s) not found: {missing}")
+    cols = ([y_col] if require_y else []) + x_cols
+    data = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    if log_y:
+        data = data[data[y_col] > 0].copy()
+        data[y_col] = np.log(data[y_col])
+    min_rows = len(x_cols) + 2 if require_y else len(x_cols) + 1
+    if len(data) < min_rows:
+        raise ValueError("Regression requires more complete numeric rows than predictors.")
+    return data
+
+
+def _fit_ols(y_col, x_cols, log_y=False, robust_cov=None):
+    data = _regression_frame(y_col, x_cols, log_y=log_y)
+    x = sm.add_constant(data[x_cols], has_constant="add")
+    model = sm.OLS(data[y_col], x).fit()
+    if robust_cov:
+        model = model.get_robustcov_results(cov_type=robust_cov)
+        model.model.data.xnames = ["const"] + list(x_cols)
+    return model
+
+
+def _run_regression(method, y_col, x_cols, log_y=False, robust_cov=None):
+    model = _fit_ols(y_col, x_cols, log_y=log_y, robust_cov=robust_cov)
+    return _regression_result(method, model, x_cols, log_y=log_y, robust_cov=robust_cov)
+
+
+def _regression_result(method, model, x_cols, log_y=False, robust_cov=None):
+    names = list(getattr(model.model.data, "xnames", ["const"] + list(x_cols)))
+    label_map = {"const": "intercept"}
+    params = dict(zip(names, model.params))
+    pvalues = dict(zip(names, model.pvalues))
+    conf = np.asarray(model.conf_int())
+    coefficients = {label_map.get(name, name): float(value) for name, value in params.items()}
+    p_values = {label_map.get(name, name): float(value) for name, value in pvalues.items()}
+    ci_95 = {label_map.get(name, name): [float(conf[idx][0]), float(conf[idx][1])] for idx, name in enumerate(names)}
+    return {
+        "method": method,
+        "coefficients": coefficients,
+        "p_values": p_values,
+        "ci_95": ci_95,
+        "r_squared": float(model.rsquared),
+        "adj_r_squared": float(model.rsquared_adj),
+        "f_statistic": float(model.fvalue) if model.fvalue is not None else None,
+        "f_p_value": float(model.f_pvalue) if model.f_pvalue is not None else None,
+        "n_obs": int(model.nobs),
+        "interpretation_hints": {
+            "significant_model": bool(model.f_pvalue < 0.05) if model.f_pvalue is not None else None,
+            "log_y": bool(log_y),
+            "robust_cov": robust_cov,
+        },
+    }
+
+
+def _missing_power_target(effect_size, alpha, power, n, effect_name="effect_size"):
+    values = {effect_name: effect_size, "alpha": alpha, "power": power, "n": n}
+    missing = [name for name, value in values.items() if value is None]
+    if len(missing) != 1:
+        raise ValueError("Power analysis requires exactly one of effect_size/r, alpha, power, or n to be None.")
+    return missing[0]
+
+
+def _power_result(computed, value, inputs, label):
+    return {
+        "computed": computed,
+        "value": float(value),
+        "inputs": inputs,
+        "interpretation": f"{label}: computed {computed} = {float(value):.6g}.",
+    }
+
+
+def _correlation_power(r, alpha, n):
+    if n <= 3:
+        raise ValueError("Correlation power requires n > 3.")
+    z_effect = abs(np.arctanh(r)) * math.sqrt(n - 3)
+    z_crit = stats.norm.ppf(1 - alpha / 2)
+    return float(stats.norm.sf(z_crit - z_effect) + stats.norm.cdf(-z_crit - z_effect))
+
+
+def _solve_correlation_n(r, alpha, target_power):
+    low, high = 4, 8
+    while _correlation_power(r, alpha, high) < target_power:
+        high *= 2
+        if high > 100000:
+            raise ValueError("Could not solve correlation sample size.")
+    for _ in range(60):
+        mid = (low + high) / 2
+        if _correlation_power(r, alpha, mid) < target_power:
+            low = mid
+        else:
+            high = mid
+    return high
+
+
+def _solve_correlation_r(alpha, target_power, n):
+    low, high = 1e-6, 0.999999
+    for _ in range(60):
+        mid = (low + high) / 2
+        if _correlation_power(mid, alpha, n) < target_power:
+            low = mid
+        else:
+            high = mid
+    return high
 
 
 def _missing(kwargs, names):
